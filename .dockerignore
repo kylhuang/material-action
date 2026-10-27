@@ -1,0 +1,10 @@
+node_modules
+.git
+.github
+.yarn
+yarn.lock
+test
+demo
+*.tgz
+*.md
+.env

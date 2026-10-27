@@ -10,8 +10,9 @@
 - [Run locally](#run-locally)
 - [Workflow scenarios](#workflow-scenarios)
 - [Scenario 1: automated PR code review](#scenario-1-automated-pr-code-review)
-- [Scenario 2: release on tag](#scenario-2-release-on-tag)
+- [Scenario 2: attach build output when a release is published](#scenario-2-attach-build-output-when-a-release-is-published)
 - [Scenario 3: Slack notification on merge](#scenario-3-slack-notification-on-merge)
+- [Scenario 4: publish a container to GitHub Packages](#scenario-4-publish-a-container-to-github-packages)
 - [Adding scenarios](#adding-scenarios)
 
 ## App overview
@@ -30,11 +31,13 @@ A small Node.js + Express API, so learners can focus on the workflows.
 ├── .github/workflows/
 │   ├── pr-code-review.yml   # Scenario 1
 │   ├── release-on-tag.yml   # Scenario 2
-│   └── notify-slack-on-merge.yml  # Scenario 3
+│   ├── notify-slack-on-merge.yml  # Scenario 3
+│   └── publish-container.yml  # Scenario 4
 ├── demo/lint-issue-example.js  # intentionally bad code (ignored by lint)
 ├── src/                     # app.js, calculator.js, server.js
 ├── test/                    # node:test unit tests
 ├── eslint.config.js
+├── Dockerfile               # image for Scenario 4
 ├── .nvmrc                   # Node.js 24 (LTS)
 └── package.json
 ```
@@ -62,8 +65,9 @@ curl -X POST http://localhost:3000/add -H "content-type: application/json" -d '{
 | # | Scenario | File | Trigger | Permissions |
 |---|---|---|---|---|
 | 1 | Automated PR code review | `pr-code-review.yml` | `pull_request` to `main` | `contents: read`, `pull-requests: write` |
-| 2 | Release on tag | `release-on-tag.yml` | `push` of tag `v*.*.*` | `contents: write` |
+| 2 | Attach build output on release publish | `release-on-tag.yml` | `release` published | `contents: write` |
 | 3 | Slack notification on merge | `notify-slack-on-merge.yml` | `pull_request` closed to `main` (merged only) | `contents: read` |
+| 4 | Publish a container to GitHub Packages | `publish-container.yml` | `push` to `main`, `release` published, manual | `packages: write` |
 
 ## Scenario 1: automated PR code review
 
@@ -111,35 +115,35 @@ Every PR to `main` then requests a Copilot review. Requires a Copilot plan (Pro,
 
 They work well together: the ESLint workflow for deterministic rules, Copilot for semantic suggestions.
 
-## Scenario 2: release on tag
+## Scenario 2: attach build output when a release is published
 
 **File:** [`.github/workflows/release-on-tag.yml`](.github/workflows/release-on-tag.yml)
 
-1. Runs when a tag matching `v*.*.*` is pushed, e.g. `v1.0.0`.
+1. Runs when you create a tag (e.g. `v1.0.0`) on the **Releases** page and click **Publish release** (`release: published`).
 2. Runs lint and tests.
 3. Sets the tag version in `package.json` (not committed) and builds a `.tgz` with `npm pack`.
-4. Creates a Release with `gh release create --generate-notes` and attaches the `.tgz`.
+4. Uploads the `.tgz` to that release with `gh release upload`.
 
-Teaching points: tag filters, `github.ref_name`, step outputs via `$GITHUB_OUTPUT`, `GITHUB_TOKEN` with the `gh` CLI.
+Teaching points: the `release` event, `github.ref_name`, step outputs via `$GITHUB_OUTPUT`, `GITHUB_TOKEN` with the `gh` CLI.
+
+> Why not `push: tags`? When you create a release in the web UI, GitHub creates the release first and then pushes the tag. A workflow listening for tag pushes that also runs `gh release create` fails with `a release with the same tag name already exists`. Listening for `release: published` and only uploading files avoids the duplicate.
 
 ### Demo steps
 
-```bash
-git switch main
-git pull
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-1. Watch **Release on Tag** in the **Actions** tab.
-2. Open **Releases** to see `v1.0.0`, the generated notes, and `tw-training-actions-demo-1.0.0.tgz`.
-3. To repeat the demo, delete the release and tag:
+1. Open the repo's **Releases** page and click **Draft a new release**.
+2. In **Choose a tag**, type `v1.0.0`, pick **Create new tag: v1.0.0 on publish**, and target `main`.
+3. Optionally click **Generate release notes**, then **Publish release**.
+4. Watch **Release Assets on Publish** in the **Actions** tab.
+5. When it finishes, the release shows the attachment `tw-training-actions-demo-1.0.0.tgz`.
+6. To repeat the demo, delete the release and tag:
    ```bash
    gh release delete v1.0.0 --cleanup-tag --yes
    git tag -d v1.0.0
    ```
 
-> Tags in another format (e.g. `v1.0` or `release-1`) don't trigger it, which is a good way to show filters.
+> The `release` event doesn't support a `tags:` filter, so a `check-tag` job first checks the tag against `v*.*.*` (e.g. `v1.0.0`) with a regex. Other tags (e.g. `v1.0` or `release-1`) get a notice and the `release` job is skipped, which shows off `needs`, job outputs, and `if`.
+
+> Saving as a **Draft** doesn't trigger it; only **Publish release** does, which is a good way to show `types` filtering.
 
 ## Scenario 3: Slack notification on merge
 
@@ -182,6 +186,39 @@ git push -u origin demo/slack-notify
 2. Watch **Notify Slack on Merge** in **Actions**; `#github-notification` gets the message.
 3. Contrast: open another PR and **Close** it without merging; the job is skipped and nothing is sent.
 
+## Scenario 4: publish a container to GitHub Packages
+
+**Files:** [`.github/workflows/publish-container.yml`](.github/workflows/publish-container.yml), [`Dockerfile`](Dockerfile)
+
+1. Runs on a push to `main`, a published release, or manually (`workflow_dispatch`).
+2. Logs in to GitHub Container Registry (`ghcr.io`) with `GITHUB_TOKEN`; no extra secret needed.
+3. `docker/metadata-action` generates image tags per event:
+   - Push to `main`: `main`, `sha-xxxxxxx`
+   - Release `v1.0.0`: `1.0.0`, `1.0`, `latest`, `sha-xxxxxxx`
+4. Builds and pushes a `linux/amd64` + `linux/arm64` image with Buildx, using the GitHub Actions cache.
+5. Generates a build provenance attestation with `actions/attest-build-provenance`.
+
+Teaching points: the `packages: write` permission, logging in to ghcr.io with `GITHUB_TOKEN`, tagging strategy, multi-platform builds, build cache, supply-chain security (attestations).
+
+### Demo steps
+
+1. Merge to `main` and watch **Publish Container** in the **Actions** tab.
+2. When it finishes, **Packages** on the repo home page lists `tw-training-material-action` with its tags.
+3. Pull and run it locally (log in first for a private package: `gh auth token | docker login ghcr.io -u <your-username> --password-stdin`):
+   ```bash
+   docker run --rm -p 3000:3000 ghcr.io/ust-pace/tw-training-material-action:main
+   curl http://localhost:3000/
+   ```
+4. Verify the attestation:
+   ```bash
+   gh attestation verify oci://ghcr.io/ust-pace/tw-training-material-action:main --repo UST-PACE/tw-training-material-action
+   ```
+5. Publish another release in the web UI (e.g. `v1.1.0`) to see the `1.1.0`, `1.1`, and `latest` tags appear.
+
+> As in Scenario 2, a published release first goes through a `check-tag` job: tags not matching `v*.*.*` (e.g. `release-1`) skip the build. Pushes to `main` and manual runs aren't checked.
+
+> New packages in an organization are private by default. To let attendees pull without logging in, use **Package settings → Change visibility** on the package page.
+
 ## Adding scenarios
 
 1. Add `<scenario>.yml` under `.github/workflows/`, with header comments for trigger and steps.
@@ -192,7 +229,7 @@ git push -u origin demo/slack-notify
 ## GitHub settings to check
 
 - **Settings → Actions → General**: Actions allowed; default workflow permissions are fine (each workflow declares `permissions`).
-- If the org restricts actions, allow `actions/checkout`, `actions/setup-node`, `actions/github-script`.
+- If the org restricts actions, allow `actions/checkout`, `actions/setup-node`, `actions/github-script`; Scenario 4 also needs `docker/*` and `actions/attest-build-provenance`.
 - Scenario 3: add repo secret `SLACK_WEBHOOK_URL` (see Scenario 3 setup).
 - (Optional) Make **PR Code Review** a required status check via a branch ruleset.
 - (Optional) Copilot automatic code review, above.
