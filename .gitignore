@@ -1,0 +1,6 @@
+node_modules/
+*.tgz
+eslint-report.json
+coverage/
+.DS_Store
+.env

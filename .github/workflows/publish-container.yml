@@ -1,0 +1,109 @@
+# =====================================================================
+# 情境 4：打包 Container 並發佈到 GitHub Packages（ghcr.io）
+# ---------------------------------------------------------------------
+# 觸發：
+#   - push 到 main：發佈 main 與 sha-xxxxxxx 標籤
+#   - 網頁發布 Release（tag 如 v1.0.0）：發佈 1.0.0、1.0、latest 標籤
+#   - 手動執行（workflow_dispatch）
+# 做什麼：
+#   0. 發布 Release 時檢查 tag 是否符合 v*.*.*，不符合就略過
+#   1. 用 GITHUB_TOKEN 登入 ghcr.io
+#   2. 依事件自動產生映像標籤與 OCI labels
+#   3. 建置多平台映像（amd64 / arm64）並推送
+#   4. 產生建置來源證明（build provenance attestation）
+# =====================================================================
+name: Publish Container
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write       # 推送到 ghcr.io
+  attestations: write   # 產生 attestation
+  id-token: write       # attestation 簽章需要 OIDC
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # 發布 Release 時，tag 必須符合 v*.*.*（例如 v1.0.0）才建置；push 到 main 與手動執行不檢查
+  check-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      valid: ${{ steps.check.outputs.valid }}
+    steps:
+      - name: 檢查 tag 格式
+        id: check
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [[ "$EVENT" != "release" ]]; then
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+            echo "事件為 $EVENT，不需檢查 tag"
+          elif [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+            echo "tag $TAG 符合 v*.*.*，繼續建置"
+          else
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::tag $TAG 不符合 v*.*.*（例如 v1.0.0），略過建置 Container"
+          fi
+
+  publish:
+    needs: check-tag
+    if: needs.check-tag.outputs.valid == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 程式碼
+        uses: actions/checkout@v7
+
+      # 讓 runner 可以建置 arm64 映像
+      - name: 設定 QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: 設定 Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: 登入 GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 自動產生標籤；也會加上 org.opencontainers.image.source，讓套件連結回這個 repo
+      - name: 產生映像標籤
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: 建置並推送映像
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 產生建置來源證明
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
