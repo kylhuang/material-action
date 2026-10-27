@@ -1,0 +1,119 @@
+# =====================================================================
+# 情境 1：PR 自動 Code Review（Pull Request automated code review）
+# ---------------------------------------------------------------------
+# 觸發：對 main 開 PR、推新 commit 到 PR、重新開啟 PR
+# 做什麼：
+#   1. 執行 ESLint（lint）與單元測試（test）
+#   2. 把 ESLint 發現的問題，以「inline review comment」貼到 PR 變更的那一行
+#   3. 有 lint error 或測試失敗時，讓這個 check 失敗（可搭配 branch ruleset 擋 merge）
+# =====================================================================
+name: PR Code Review
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+# 最小權限原則（least privilege）：只讀程式碼、可寫 PR review
+permissions:
+  contents: read
+  pull-requests: write
+
+# 同一個 PR 有新 push 時，取消舊的執行（concurrency）
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 程式碼
+        uses: actions/checkout@v7
+
+      - name: 安裝 Node.js（版本讀取 .nvmrc）
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: 安裝相依套件（npm ci 依 package-lock.json 安裝）
+        run: npm ci
+
+      # 先把結果存成 JSON，交給下一步貼留言；continue-on-error 讓流程繼續
+      - name: 執行 ESLint
+        id: lint
+        continue-on-error: true
+        run: npx eslint . --format json --output-file eslint-report.json
+
+      - name: 執行單元測試
+        id: test
+        continue-on-error: true
+        run: npm test
+
+      # 用 actions/github-script 呼叫 GitHub REST API 建立 PR review
+      - name: 把 ESLint 結果貼成 PR review
+        if: always()
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { owner, repo } = context.repo;
+            const pull_number = context.payload.pull_request.number;
+
+            let report = [];
+            if (fs.existsSync('eslint-report.json')) {
+              report = JSON.parse(fs.readFileSync('eslint-report.json', 'utf8'));
+            }
+
+            // GitHub 只允許在 PR「有變更的行」留 inline comment，所以先解析 diff
+            const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number });
+            const changedLines = {};
+            for (const f of files) {
+              const lines = new Set();
+              let line = 0;
+              for (const row of (f.patch || '').split('\n')) {
+                const m = row.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
+                if (m) { line = Number(m[1]); continue; }
+                if (row.startsWith('-')) continue;
+                if (row.startsWith('+')) lines.add(line);
+                line++;
+              }
+              changedLines[f.filename] = lines;
+            }
+
+            const comments = [];
+            const others = [];
+            for (const file of report) {
+              const rel = path.relative(process.env.GITHUB_WORKSPACE, file.filePath);
+              for (const msg of file.messages) {
+                const level = msg.severity === 2 ? '🔴 error' : '🟡 warning';
+                const body = `**ESLint ${level}** \`${msg.ruleId || 'parse'}\`：${msg.message}`;
+                if (changedLines[rel] && changedLines[rel].has(msg.line)) {
+                  comments.push({ path: rel, line: msg.line, side: 'RIGHT', body });
+                } else {
+                  others.push(`- \`${rel}:${msg.line}\` ${body}`);
+                }
+              }
+            }
+
+            const testOk = '${{ steps.test.outcome }}' === 'success';
+            const total = comments.length + others.length;
+            let summary = `## 🤖 自動 Code Review 結果\n\n`;
+            summary += `- ESLint：${total === 0 ? '✅ 沒有問題' : `⚠️ ${total} 個問題`}\n`;
+            summary += `- 單元測試：${testOk ? '✅ 通過' : '❌ 失敗，請看 Actions log'}\n`;
+            if (others.length) summary += `\n### 不在本次變更行上的問題\n${others.join('\n')}\n`;
+
+            await github.rest.pulls.createReview({
+              owner, repo, pull_number,
+              event: 'COMMENT',   // 只留言，不 approve / request changes
+              body: summary,
+              comments,
+            });
+
+      - name: 有問題時讓 check 失敗
+        if: steps.lint.outcome != 'success' || steps.test.outcome != 'success'
+        run: |
+          echo "::error::Lint 或測試沒有通過（lint=${{ steps.lint.outcome }}, test=${{ steps.test.outcome }}）"
+          exit 1
