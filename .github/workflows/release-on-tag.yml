@@ -1,25 +1,46 @@
 # =====================================================================
-# 情境 2：推送 Tag 自動發布 Release（Release on tag）
+# 情境 2：在 GitHub 網頁發布 Release 後，自動附上打包產物
 # ---------------------------------------------------------------------
-# 觸發：推送符合 v*.*.* 的 tag，例如 v1.0.0
+# 觸發：在 Releases 頁面建立 tag（例如 v1.0.0）並按下 Publish release
 # 做什麼：
 #   1. 執行測試，確保要發布的版本是好的
 #   2. 用 npm pack 打包成 .tgz
-#   3. 建立 GitHub Release，自動產生 release notes 並附上 .tgz
+#   3. 把 .tgz 上傳到這個 Release（Release 由網頁建立，workflow 不再建立）
 # =====================================================================
-name: Release on Tag
+name: Release Assets on Publish
 
+# 不監聽 tag push，否則網頁建 Release 時推出的 tag 也會觸發，造成重複建立
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  release:
+    types: [published]
 
-# 建立 Release 需要寫入 contents
+# 上傳 Release 檔案需要寫入 contents
 permissions:
   contents: write
 
 jobs:
+  # release 事件不支援 tags: 篩選，所以先用一個 job 檢查 tag 是否符合 v*.*.*（例如 v1.0.0）
+  check-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      valid: ${{ steps.check.outputs.valid }}
+    steps:
+      - name: 檢查 tag 格式
+        id: check
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+            echo "tag $TAG 符合 v*.*.*，繼續打包"
+          else
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::tag $TAG 不符合 v*.*.*（例如 v1.0.0），略過打包"
+          fi
+
   release:
+    needs: check-tag
+    if: needs.check-tag.outputs.valid == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout 程式碼
@@ -39,7 +60,7 @@ jobs:
           npm run lint
           npm test
 
-      # github.ref_name 就是 tag 名稱，例如 v1.0.0；去掉 v 當成套件版本
+      # release 事件的 github.ref_name 就是這個 Release 的 tag 名稱，例如 v1.0.0；去掉 v 當成套件版本
       - name: 依 tag 設定版本並打包（npm pack）
         id: pack
         run: |
@@ -50,11 +71,8 @@ jobs:
           echo "打包完成：$FILE"
 
       # gh CLI 已內建在 GitHub-hosted runner，使用 GITHUB_TOKEN 驗證
-      - name: 建立 GitHub Release
+      - name: 上傳 .tgz 到 Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" "${{ steps.pack.outputs.file }}" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            --verify-tag
+          FILE: ${{ steps.pack.outputs.file }}
+        run: gh release upload "$GITHUB_REF_NAME" "$FILE" --clobber
