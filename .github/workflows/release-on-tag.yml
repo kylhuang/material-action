@@ -1,0 +1,60 @@
+# =====================================================================
+# 情境 2：推送 Tag 自動發布 Release（Release on tag）
+# ---------------------------------------------------------------------
+# 觸發：推送符合 v*.*.* 的 tag，例如 v1.0.0
+# 做什麼：
+#   1. 執行測試，確保要發布的版本是好的
+#   2. 用 npm pack 打包成 .tgz
+#   3. 建立 GitHub Release，自動產生 release notes 並附上 .tgz
+# =====================================================================
+name: Release on Tag
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+# 建立 Release 需要寫入 contents
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 程式碼
+        uses: actions/checkout@v7
+
+      - name: 安裝 Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: 安裝相依套件
+        run: npm ci
+
+      - name: Lint 與測試
+        run: |
+          npm run lint
+          npm test
+
+      # github.ref_name 就是 tag 名稱，例如 v1.0.0；去掉 v 當成套件版本
+      - name: 依 tag 設定版本並打包（npm pack）
+        id: pack
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          FILE=$(npm pack --silent)
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "打包完成：$FILE"
+
+      # gh CLI 已內建在 GitHub-hosted runner，使用 GITHUB_TOKEN 驗證
+      - name: 建立 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "${{ steps.pack.outputs.file }}" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag

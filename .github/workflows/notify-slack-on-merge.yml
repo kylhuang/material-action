@@ -1,0 +1,88 @@
+# =====================================================================
+# 情境 3：PR Merge 到 main 後發送 Slack 通知（Notify Slack on merge）
+# ---------------------------------------------------------------------
+# 觸發：PR 被關閉（closed）且目標是 main，並用 if 判斷「真的有 merge」
+#
+# 為什麼不用 push？
+#   - pull_request closed 事件帶有完整 PR 資訊（標題、作者、merge 的人、分支），
+#     通知內容比較豐富。
+#   - 「關閉但沒 merge」的 PR 也會觸發 closed，所以要加
+#     if: github.event.pull_request.merged == true 過濾掉。
+#   - 替代方案：on: push: branches: [main]，任何推到 main 的 commit 都會通知
+#     （包含直接 push），但拿不到 PR 資訊。
+#
+# Webhook URL 放在 Secret：SLACK_WEBHOOK_URL，絕對不要寫進檔案。
+# Incoming Webhook 建立時就綁定頻道（本示範為 #github-notification），
+# payload 無法改送到其他頻道。
+# =====================================================================
+name: Notify Slack on Merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+# 最小權限：這個 job 不需要寫入任何東西
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    # 只有真正 merge 的 PR 才執行
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: 發送 Slack 通知
+        # 安全重點（script injection）：PR 標題等使用者可控的內容
+        # 一律透過 env 傳入，不直接寫成 ${{ }} 嵌進 shell 或 JSON。
+        # 再由 jq --arg 組 JSON，自動處理引號與特殊字元。
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          MERGED_BY: ${{ github.event.pull_request.merged_by.login }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "::warning::未設定 SLACK_WEBHOOK_URL secret，略過 Slack 通知"
+            exit 0
+          fi
+
+          SHORT_SHA="${MERGE_SHA:0:7}"
+
+          # 用 jq 組 Block Kit payload（https://api.slack.com/block-kit）
+          PAYLOAD=$(jq -n \
+            --arg repo "$REPO" --arg num "$PR_NUMBER" --arg title "$PR_TITLE" \
+            --arg url "$PR_URL" --arg author "$PR_AUTHOR" --arg merger "$MERGED_BY" \
+            --arg base "$BASE_REF" --arg head "$HEAD_REF" --arg sha "$SHORT_SHA" \
+            --arg run "$RUN_URL" '
+            {
+              text: "PR #\($num) merged into \($base) in \($repo)",
+              blocks: [
+                { type: "header",
+                  text: { type: "plain_text", text: "✅ PR merged into \($base)" } },
+                { type: "section",
+                  text: { type: "mrkdwn", text: "*<\($url)|#\($num) \($title)>*" } },
+                { type: "section",
+                  fields: [
+                    { type: "mrkdwn", text: "*Repository*\n\($repo)" },
+                    { type: "mrkdwn", text: "*Branch*\n`\($base)` ← `\($head)`" },
+                    { type: "mrkdwn", text: "*Author*\n\($author)" },
+                    { type: "mrkdwn", text: "*Merged by*\n\($merger)" },
+                    { type: "mrkdwn", text: "*Commit*\n`\($sha)`" }
+                  ] },
+                { type: "context",
+                  elements: [ { type: "mrkdwn", text: "<\($run)|View workflow run>" } ] }
+              ]
+            }')
+
+          curl --fail --silent --show-error \
+            -X POST -H 'Content-type: application/json' \
+            --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
+          echo "Slack 通知已送出"
